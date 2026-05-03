@@ -67,6 +67,8 @@ python PicoBoardBridge.py --serial-port COM5
 
 ### 4. 在 TurboWarp 加载扩展
 
+TurboWarp 官方网站：https://turbowarp.org/
+
 1. 打开 TurboWarp Desktop 或在线版。
 2. 选择加载本地扩展文件。
 3. 选择本仓库中的 extension.js。
