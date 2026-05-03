@@ -290,6 +290,7 @@ BUTTON_RELEASE_DEBOUNCE_FRAMES = 2
 BUTTON_SCAN_CANDIDATES = []
 BUTTON_SCAN_MASK = LEGACY_BUTTON_MASK
 BUTTON_SCAN_LOG_EVERY_FRAMES = 50
+SERIAL_RECONNECT_DELAY_SEC = 2.0
 
 serial_log_file = None
 serial_log_lock = threading.Lock()
@@ -506,106 +507,120 @@ async def ws_handler(ws):
 
 # -----------------------------
 def serial_thread():
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.1)
-        print(f"[Serial] Connected to {SERIAL_PORT} at {BAUDRATE}bps")
-        write_serial_log("serial_connected", {"port": SERIAL_PORT, "baudrate": BAUDRATE})
-        frame_count = 0
-        reported_protocol = None
-        stable_button_state = None
-        candidate_button_state = None
-        candidate_since = None
-        candidate_frames = 0
-        stable_edge_count = 0
-        while True:
-            # 激活采样
-            ser.write(b'\x01')
-            ser.flush()
-            write_serial_log("tx", {"hex": "01"})
-            if LOG_SERIAL:
-                print("[Serial][TX] 01")
-            # 读取串口字节流，交给解析器按 0x80 自动对齐
-            chunk = ser.read(64)
-            if chunk:
-                write_serial_log("rx", {"hex": chunk.hex(' ')})
-                if LOG_SERIAL and LOG_FRAME_HEX:
-                    print(f"[Serial][RX] {chunk.hex(' ')}")
-                pico.feed_bytes(chunk)
-                if pico.active_protocol and pico.active_protocol != reported_protocol:
-                    reported_protocol = pico.active_protocol
-                    print(f"[Parser] Active protocol: {reported_protocol}")
-                    write_serial_log("parser_protocol", {"mode": reported_protocol})
+    frame_count = 0
+    reported_protocol = None
+    stable_button_state = None
+    candidate_button_state = None
+    candidate_since = None
+    candidate_frames = 0
+    stable_edge_count = 0
 
-                for scan_event in pico.drain_button_scan_events():
-                    write_serial_log("button_scan_raw_edge", scan_event)
+    while True:
+        ser = None
+        try:
+            ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.1)
+            print(f"[Serial] Connected to {SERIAL_PORT} at {BAUDRATE}bps")
+            write_serial_log("serial_connected", {"port": SERIAL_PORT, "baudrate": BAUDRATE})
 
-                # 按键边沿防抖后上报，避免噪声抖动误触发
-                now = time.monotonic()
-                # 直接从原始解析值读取，不经过 stable 覆盖
-                button_state = int(pico.values.get("button", 0))
-                if stable_button_state is None:
-                    stable_button_state = button_state
-                    candidate_button_state = button_state
-                    candidate_since = now
-                    candidate_frames = 1
-                if button_state != candidate_button_state:
-                    candidate_button_state = button_state
-                    candidate_since = now
-                    candidate_frames = 1
-                else:
-                    candidate_frames += 1
+            while True:
+                # 激活采样
+                ser.write(b'\x01')
+                ser.flush()
+                write_serial_log("tx", {"hex": "01"})
+                if LOG_SERIAL:
+                    print("[Serial][TX] 01")
+                # 读取串口字节流，交给解析器按 0x80 自动对齐
+                chunk = ser.read(64)
+                if chunk:
+                    write_serial_log("rx", {"hex": chunk.hex(' ')})
+                    if LOG_SERIAL and LOG_FRAME_HEX:
+                        print(f"[Serial][RX] {chunk.hex(' ')}")
+                    pico.feed_bytes(chunk)
+                    if pico.active_protocol and pico.active_protocol != reported_protocol:
+                        reported_protocol = pico.active_protocol
+                        print(f"[Parser] Active protocol: {reported_protocol}")
+                        write_serial_log("parser_protocol", {"mode": reported_protocol})
 
-                # 非对称防抖：按下和释放使用不同阈值
-                target_ms = BUTTON_PRESS_DEBOUNCE_MS if candidate_button_state == 1 else BUTTON_RELEASE_DEBOUNCE_MS
-                target_frames = (
-                    BUTTON_PRESS_DEBOUNCE_FRAMES if candidate_button_state == 1 else BUTTON_RELEASE_DEBOUNCE_FRAMES
-                )
+                    for scan_event in pico.drain_button_scan_events():
+                        write_serial_log("button_scan_raw_edge", scan_event)
 
-                if (
-                    candidate_button_state != stable_button_state
-                    and candidate_since is not None
-                    and (now - candidate_since) * 1000 >= target_ms
-                    and candidate_frames >= target_frames
-                ):
-                    stable_button_state = candidate_button_state
-                    edge = "press" if stable_button_state == 1 else "release"
-                    pico.set_stable_button(stable_button_state)
-                    write_serial_log(
-                        "button_edge",
-                        {
-                            "edge": edge,
-                            "button": stable_button_state,
-                            "values": pico.get_values(),
-                        },
+                    # 按键边沿防抖后上报，避免噪声抖动误触发
+                    now = time.monotonic()
+                    # 直接从原始解析值读取，不经过 stable 覆盖
+                    button_state = int(pico.values.get("button", 0))
+                    if stable_button_state is None:
+                        stable_button_state = button_state
+                        candidate_button_state = button_state
+                        candidate_since = now
+                        candidate_frames = 1
+                    if button_state != candidate_button_state:
+                        candidate_button_state = button_state
+                        candidate_since = now
+                        candidate_frames = 1
+                    else:
+                        candidate_frames += 1
+
+                    # 非对称防抖：按下和释放使用不同阈值
+                    target_ms = BUTTON_PRESS_DEBOUNCE_MS if candidate_button_state == 1 else BUTTON_RELEASE_DEBOUNCE_MS
+                    target_frames = (
+                        BUTTON_PRESS_DEBOUNCE_FRAMES if candidate_button_state == 1 else BUTTON_RELEASE_DEBOUNCE_FRAMES
                     )
-                    stable_edge_count += 1
-                    if LOG_SERIAL:
-                        print(f"[Serial][Button] {edge}: {pico.get_values()}")
-                    candidate_frames = 0
 
-                # 初始化时同步一次 stable button
-                if stable_button_state is not None:
-                    pico.set_stable_button(stable_button_state)
+                    if (
+                        candidate_button_state != stable_button_state
+                        and candidate_since is not None
+                        and (now - candidate_since) * 1000 >= target_ms
+                        and candidate_frames >= target_frames
+                    ):
+                        stable_button_state = candidate_button_state
+                        edge = "press" if stable_button_state == 1 else "release"
+                        pico.set_stable_button(stable_button_state)
+                        write_serial_log(
+                            "button_edge",
+                            {
+                                "edge": edge,
+                                "button": stable_button_state,
+                                "values": pico.get_values(),
+                            },
+                        )
+                        stable_edge_count += 1
+                        if LOG_SERIAL:
+                            print(f"[Serial][Button] {edge}: {pico.get_values()}")
+                        candidate_frames = 0
 
-                frame_count += 1
-                if LOG_SERIAL and frame_count % LOG_VALUES_EVERY_N_FRAMES == 0:
-                    print(f"[Serial][Values] {pico.get_values()}")
-                if frame_count % LOG_VALUES_EVERY_N_FRAMES == 0:
-                    write_serial_log("values", pico.get_values())
-                if (
-                    BUTTON_SCAN_CANDIDATES
-                    and frame_count % BUTTON_SCAN_LOG_EVERY_FRAMES == 0
-                ):
-                    write_serial_log("button_scan_summary", {
-                        "stable_edges": stable_edge_count,
-                        "scan_mask": BUTTON_SCAN_MASK,
-                        "candidates": BUTTON_SCAN_CANDIDATES,
-                        "stats": pico.get_button_scan_summary(),
-                    })
-            time.sleep(0.03)
-    except Exception as e:
-        print(f"[Serial] Error: {e}")
-        write_serial_log("serial_error", {"message": str(e)})
+                    # 初始化时同步一次 stable button
+                    if stable_button_state is not None:
+                        pico.set_stable_button(stable_button_state)
+
+                    frame_count += 1
+                    if LOG_SERIAL and frame_count % LOG_VALUES_EVERY_N_FRAMES == 0:
+                        print(f"[Serial][Values] {pico.get_values()}")
+                    if frame_count % LOG_VALUES_EVERY_N_FRAMES == 0:
+                        write_serial_log("values", pico.get_values())
+                    if (
+                        BUTTON_SCAN_CANDIDATES
+                        and frame_count % BUTTON_SCAN_LOG_EVERY_FRAMES == 0
+                    ):
+                        write_serial_log("button_scan_summary", {
+                            "stable_edges": stable_edge_count,
+                            "scan_mask": BUTTON_SCAN_MASK,
+                            "candidates": BUTTON_SCAN_CANDIDATES,
+                            "stats": pico.get_button_scan_summary(),
+                        })
+                time.sleep(0.03)
+
+        except Exception as e:
+            print(f"[Serial] Error: {e}")
+            write_serial_log("serial_error", {"message": str(e)})
+            print(f"[Serial] Reconnect in {SERIAL_RECONNECT_DELAY_SEC:.1f}s...")
+            write_serial_log("serial_reconnect_wait", {"seconds": SERIAL_RECONNECT_DELAY_SEC})
+            time.sleep(SERIAL_RECONNECT_DELAY_SEC)
+        finally:
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
 # -----------------------------
 async def main_async():
     print(f"[WS] Starting WS server at ws://{WS_HOST}:{WS_PORT}")
